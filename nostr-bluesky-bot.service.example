@@ -1,0 +1,19 @@
+[Unit]
+Description=Nostr to Bluesky Cross-Poster Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=YOUR_USERNAME
+WorkingDirectory=/home/YOUR_USERNAME/Projects/bluebot
+Environment="PATH=/home/YOUR_USERNAME/Projects/bluebot/venv/bin"
+ExecStart=/home/YOUR_USERNAME/Projects/bluebot/venv/bin/python /home/YOUR_USERNAME/Projects/bluebot/bot.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nostr-bluesky-bot
+
+[Install]
+WantedBy=multi-user.target

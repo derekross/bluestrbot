@@ -1,0 +1,5 @@
+nostr-sdk>=0.34.0
+atproto>=0.0.55
+python-dotenv>=1.0.0
+httpx>=0.24.0
+Pillow>=10.0.0
