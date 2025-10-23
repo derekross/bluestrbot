@@ -14,7 +14,7 @@ import logging
 import re
 import json
 from io import BytesIO
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Set, List, Tuple, Dict
 
 import httpx
@@ -25,7 +25,6 @@ from nostr_sdk import (
     Kind, Timestamp, RelayUrl, init_logger, LogLevel
 )
 from atproto import Client as BlueskyClient, client_utils, models
-from atproto.xrpc_client.models.utils import get_or_create
 
 # Configure logging
 logging.basicConfig(
@@ -201,40 +200,36 @@ class NostrToBlueskyBot:
             pubkey = PublicKey.parse(npub)
             logger.debug(f"Querying connected relays for metadata: {npub[:16]}...")
 
-            # Create a filter for kind 0 events (user metadata) for this pubkey
-            metadata_filter = Filter().author(pubkey).kind(Kind(0)).limit(1)
+            # Fetch metadata using the SDK's built-in method
+            # This will query all connected relays
+            metadata = await self.nostr_client.fetch_metadata(pubkey, timedelta(seconds=5))
 
-            # Query all connected relays for metadata
-            # Use get_events_of with a timeout
-            events = await self.nostr_client.get_events_of(
-                [metadata_filter],
-                timeout=5  # 5 second timeout
-            )
-
-            if not events or len(events) == 0:
+            if not metadata:
                 logger.warning(f"No metadata found for {npub} on any connected relay")
                 return None
 
-            # Get the most recent metadata event
-            metadata_event = events[0]
-            content = metadata_event.content()
+            # Parse the metadata JSON to extract name/display_name
+            try:
+                metadata_json = metadata.as_json()
+                data = json.loads(metadata_json)
 
-            # Parse the JSON metadata
-            metadata = json.loads(content)
+                display_name = data.get('display_name')
+                name = data.get('name')
 
-            # Extract name or display_name
-            display_name = metadata.get('display_name') or metadata.get('name') or None
+                # Use display_name if available, otherwise fall back to name
+                final_name = display_name or name
 
-            if display_name:
-                logger.info(f"✓ Resolved {npub[:16]}... → '{display_name}'")
-                return {'display_name': display_name, 'name': metadata.get('name', '')}
-            else:
-                logger.warning(f"Metadata found but no display name for {npub}")
+                if final_name:
+                    logger.info(f"✓ Resolved {npub[:16]}... → '{final_name}'")
+                    return {'display_name': final_name, 'name': name or ''}
+                else:
+                    logger.warning(f"Metadata has no name or display_name")
+                    return None
+
+            except (json.JSONDecodeError, AttributeError) as e:
+                logger.warning(f"Failed to parse metadata: {e}")
                 return None
 
-        except json.JSONDecodeError as e:
-            logger.warning(f"Failed to parse metadata JSON for {npub}: {e}")
-            return None
         except Exception as e:
             logger.warning(f"Failed to fetch metadata for {npub}: {e}")
             return None
