@@ -12,9 +12,10 @@ import time
 import asyncio
 import logging
 import re
+import json
 from io import BytesIO
 from datetime import datetime, timezone
-from typing import Optional, Set, List, Tuple
+from typing import Optional, Set, List, Tuple, Dict
 
 import httpx
 from PIL import Image
@@ -165,6 +166,94 @@ class NostrToBlueskyBot:
 
         return cleaned_content
 
+    def extract_npub_mentions(self, content: str) -> List[str]:
+        """Extract nostr:npub mentions from content"""
+        # Pattern to match nostr:npub followed by bech32 encoded public key
+        npub_pattern = r'nostr:(npub1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]+)'
+        matches = re.findall(npub_pattern, content)
+        return matches
+
+    async def fetch_profile_metadata(self, npub: str) -> Optional[Dict[str, str]]:
+        """
+        Fetch profile metadata for a given npub
+        Returns dict with 'name' and 'display_name' fields or None if failed
+        """
+        try:
+            # Parse the npub to get the public key
+            pubkey = PublicKey.parse(npub)
+
+            # Create a filter for kind 0 events (user metadata) for this pubkey
+            metadata_filter = Filter().author(pubkey).kind(Kind(0)).limit(1)
+
+            # Query the relay for metadata
+            # Use get_events_of with a timeout
+            events = await self.nostr_client.get_events_of(
+                [metadata_filter],
+                timeout=5  # 5 second timeout
+            )
+
+            if not events or len(events) == 0:
+                logger.debug(f"No metadata found for {npub}")
+                return None
+
+            # Get the most recent metadata event
+            metadata_event = events[0]
+            content = metadata_event.content()
+
+            # Parse the JSON metadata
+            metadata = json.loads(content)
+
+            # Extract name or display_name
+            display_name = metadata.get('display_name') or metadata.get('name') or None
+
+            if display_name:
+                logger.info(f"Found display name '{display_name}' for {npub}")
+                return {'display_name': display_name, 'name': metadata.get('name', '')}
+            else:
+                logger.debug(f"No display name found in metadata for {npub}")
+                return None
+
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed to parse metadata JSON for {npub}: {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to fetch metadata for {npub}: {e}")
+            return None
+
+    async def replace_npub_mentions(self, content: str) -> str:
+        """
+        Replace nostr:npub mentions with display names
+        Example: 'hello nostr:npub1v5u...' -> 'hello Fountain'
+        """
+        # Extract all npub mentions
+        npubs = self.extract_npub_mentions(content)
+
+        if not npubs:
+            return content
+
+        logger.info(f"Found {len(npubs)} npub mention(s) to resolve")
+
+        # Create a copy of content to modify
+        modified_content = content
+
+        # Fetch metadata for each unique npub
+        for npub in set(npubs):  # Use set to avoid duplicate fetches
+            metadata = await self.fetch_profile_metadata(npub)
+
+            if metadata and metadata.get('display_name'):
+                display_name = metadata['display_name']
+                # Replace all occurrences of nostr:npub with the display name
+                mention_pattern = f"nostr:{npub}"
+                modified_content = modified_content.replace(mention_pattern, display_name)
+                logger.info(f"Replaced {mention_pattern} with '{display_name}'")
+            else:
+                # If we can't fetch metadata, keep the npub but remove the nostr: prefix
+                mention_pattern = f"nostr:{npub}"
+                modified_content = modified_content.replace(mention_pattern, npub)
+                logger.debug(f"Could not resolve {npub}, keeping npub without prefix")
+
+        return modified_content
+
     async def download_image(self, url: str, max_size_mb: int = 10) -> Optional[Tuple[bytes, str]]:
         """
         Download an image from a URL
@@ -293,6 +382,9 @@ class NostrToBlueskyBot:
         timestamp = datetime.fromtimestamp(event.created_at().as_secs(), tz=timezone.utc)
         logger.info(f"New note from {author} at {timestamp}")
         logger.info(f"Content preview: {content[:100]}...")
+
+        # Replace nostr:npub mentions with display names
+        content = await self.replace_npub_mentions(content)
 
         # Extract image URLs from content
         image_urls = self.extract_image_urls(content)
