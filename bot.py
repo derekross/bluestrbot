@@ -25,6 +25,7 @@ from nostr_sdk import (
     Kind, Timestamp, RelayUrl, init_logger, LogLevel
 )
 from atproto import Client as BlueskyClient, client_utils, models
+from atproto.xrpc_client.models.utils import get_or_create
 
 # Configure logging
 logging.basicConfig(
@@ -114,14 +115,31 @@ class NostrToBlueskyBot:
         # Create Nostr client
         self.nostr_client = Client()
 
-        # Add relay
+        # Add primary relay for event subscription
         relay_url = RelayUrl.parse(self.nostr_relay)
         await self.nostr_client.add_relay(relay_url)
-        logger.info(f"Added relay: {self.nostr_relay}")
+        logger.info(f"Added primary relay: {self.nostr_relay}")
 
-        # Connect to relay
+        # Add additional popular relays for metadata lookups
+        # These improve the chances of finding user profile information
+        additional_relays = [
+            "wss://relay.damus.io",
+            "wss://nos.lol",
+            "wss://relay.nostr.band",
+            "wss://purplepag.es",
+        ]
+
+        for relay in additional_relays:
+            try:
+                relay_url = RelayUrl.parse(relay)
+                await self.nostr_client.add_relay(relay_url)
+                logger.info(f"Added metadata relay: {relay}")
+            except Exception as e:
+                logger.warning(f"Failed to add relay {relay}: {e}")
+
+        # Connect to all relays
         await self.nostr_client.connect()
-        logger.info("Connected to Nostr relay")
+        logger.info("Connected to Nostr relays")
 
     async def connect_bluesky(self):
         """Authenticate with Bluesky"""
@@ -175,17 +193,18 @@ class NostrToBlueskyBot:
 
     async def fetch_profile_metadata(self, npub: str) -> Optional[Dict[str, str]]:
         """
-        Fetch profile metadata for a given npub
+        Fetch profile metadata for a given npub from connected relays
         Returns dict with 'name' and 'display_name' fields or None if failed
         """
         try:
             # Parse the npub to get the public key
             pubkey = PublicKey.parse(npub)
+            logger.debug(f"Querying connected relays for metadata: {npub[:16]}...")
 
             # Create a filter for kind 0 events (user metadata) for this pubkey
             metadata_filter = Filter().author(pubkey).kind(Kind(0)).limit(1)
 
-            # Query the relay for metadata
+            # Query all connected relays for metadata
             # Use get_events_of with a timeout
             events = await self.nostr_client.get_events_of(
                 [metadata_filter],
@@ -193,7 +212,7 @@ class NostrToBlueskyBot:
             )
 
             if not events or len(events) == 0:
-                logger.debug(f"No metadata found for {npub}")
+                logger.warning(f"No metadata found for {npub} on any connected relay")
                 return None
 
             # Get the most recent metadata event
@@ -207,10 +226,10 @@ class NostrToBlueskyBot:
             display_name = metadata.get('display_name') or metadata.get('name') or None
 
             if display_name:
-                logger.info(f"Found display name '{display_name}' for {npub}")
+                logger.info(f"✓ Resolved {npub[:16]}... → '{display_name}'")
                 return {'display_name': display_name, 'name': metadata.get('name', '')}
             else:
-                logger.debug(f"No display name found in metadata for {npub}")
+                logger.warning(f"Metadata found but no display name for {npub}")
                 return None
 
         except json.JSONDecodeError as e:
@@ -231,13 +250,15 @@ class NostrToBlueskyBot:
         if not npubs:
             return content
 
-        logger.info(f"Found {len(npubs)} npub mention(s) to resolve")
+        unique_npubs = list(set(npubs))  # Deduplicate
+        logger.info(f"Found {len(npubs)} npub mention(s) ({len(unique_npubs)} unique) to resolve")
 
         # Create a copy of content to modify
         modified_content = content
+        resolved_count = 0
 
         # Fetch metadata for each unique npub
-        for npub in set(npubs):  # Use set to avoid duplicate fetches
+        for npub in unique_npubs:
             metadata = await self.fetch_profile_metadata(npub)
 
             if metadata and metadata.get('display_name'):
@@ -245,14 +266,60 @@ class NostrToBlueskyBot:
                 # Replace all occurrences of nostr:npub with the display name
                 mention_pattern = f"nostr:{npub}"
                 modified_content = modified_content.replace(mention_pattern, display_name)
-                logger.info(f"Replaced {mention_pattern} with '{display_name}'")
+                resolved_count += 1
             else:
                 # If we can't fetch metadata, keep the npub but remove the nostr: prefix
                 mention_pattern = f"nostr:{npub}"
                 modified_content = modified_content.replace(mention_pattern, npub)
-                logger.debug(f"Could not resolve {npub}, keeping npub without prefix")
+                logger.warning(f"✗ Could not resolve {npub[:16]}..., keeping npub")
+
+        if resolved_count > 0:
+            logger.info(f"Successfully resolved {resolved_count}/{len(unique_npubs)} mentions")
+        else:
+            logger.warning(f"Failed to resolve any mentions (0/{len(unique_npubs)})")
 
         return modified_content
+
+    def count_graphemes(self, text: str) -> int:
+        """
+        Count graphemes in text (Bluesky uses grapheme count, not character count)
+        Using a simple approach that's good enough for most cases
+        """
+        try:
+            # Try to use the grapheme library if available
+            import grapheme
+            return grapheme.length(text)
+        except ImportError:
+            # Fallback to character count (not perfect but better than nothing)
+            # This is a rough approximation
+            return len(text)
+
+    def truncate_content(self, content: str, max_graphemes: int = 300) -> Tuple[str, bool]:
+        """
+        Truncate content to fit within Bluesky's grapheme limit
+        Returns (truncated_content, was_truncated)
+        """
+        grapheme_count = self.count_graphemes(content)
+
+        if grapheme_count <= max_graphemes:
+            return (content, False)
+
+        # Need to truncate - add ellipsis
+        # Reserve space for " [...]" (7 characters)
+        target_length = max_graphemes - 7
+
+        # Simple truncation by character count (good enough approximation)
+        # Try to truncate at word boundary
+        truncated = content[:target_length]
+
+        # Try to break at last space/newline
+        last_break = max(truncated.rfind(' '), truncated.rfind('\n'))
+        if last_break > target_length * 0.8:  # Only break at word if it's not too far back
+            truncated = truncated[:last_break]
+
+        truncated = truncated.strip() + " [...]"
+
+        return (truncated, True)
 
     async def download_image(self, url: str, max_size_mb: int = 10) -> Optional[Tuple[bytes, str]]:
         """
@@ -331,6 +398,19 @@ class NostrToBlueskyBot:
                 post_content = self.remove_image_urls(content, successfully_processed_urls)
                 logger.info(f"Removed {len(successfully_processed_urls)} image URL(s) from text")
 
+            # Check and truncate content if needed
+            grapheme_count = self.count_graphemes(post_content)
+            logger.info(f"Post length: {grapheme_count} graphemes (limit: 300)")
+
+            if grapheme_count > 300:
+                logger.warning(f"Post exceeds 300 grapheme limit ({grapheme_count}), truncating...")
+                post_content, was_truncated = self.truncate_content(post_content, max_graphemes=300)
+                if was_truncated:
+                    logger.warning(f"Content truncated to {self.count_graphemes(post_content)} graphemes")
+
+            # Log final content for debugging
+            logger.info(f"Final post content ({len(post_content)} chars): {post_content[:200]}...")
+
             # Build the post
             if images:
                 # Post with images
@@ -347,7 +427,14 @@ class NostrToBlueskyBot:
             return True
 
         except Exception as e:
+            # Log detailed error information
             logger.error(f"Failed to post to Bluesky: {e}", exc_info=True)
+
+            # If it's a length error, log the content for debugging
+            if "300 graphemes" in str(e) or "must not be longer" in str(e):
+                logger.error(f"Length error - Content length: {len(content)} chars")
+                logger.error(f"Content preview: {content[:500]}")
+
             return False
 
     async def handle_nostr_event(self, event: Event):
