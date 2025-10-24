@@ -22,7 +22,7 @@ from PIL import Image
 from dotenv import load_dotenv
 from nostr_sdk import (
     Client, Filter, PublicKey, Event, RelayMessage,
-    Kind, Timestamp, RelayUrl, init_logger, LogLevel
+    Kind, Timestamp, RelayUrl, init_logger, LogLevel, Nip19
 )
 from atproto import Client as BlueskyClient, client_utils, models
 
@@ -183,29 +183,48 @@ class NostrToBlueskyBot:
 
         return cleaned_content
 
+    def is_quote_event(self, content: str) -> bool:
+        """Check if a note is a quote event by looking for nostr:nevent references"""
+        # Pattern to match nostr:nevent followed by bech32 encoded data
+        nevent_pattern = r'nostr:nevent1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]+'
+        return bool(re.search(nevent_pattern, content))
+
     def extract_npub_mentions(self, content: str) -> List[str]:
-        """Extract nostr:npub mentions from content"""
-        # Pattern to match nostr:npub followed by bech32 encoded public key
-        npub_pattern = r'nostr:(npub1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]+)'
-        matches = re.findall(npub_pattern, content)
+        """Extract nostr:npub and nostr:nprofile mentions from content"""
+        # Pattern to match nostr:npub or nostr:nprofile followed by bech32 encoded data
+        # npub1... for public keys
+        # nprofile1... for profiles (includes pubkey + optional relays)
+        mention_pattern = r'nostr:((?:npub|nprofile)1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]+)'
+        matches = re.findall(mention_pattern, content)
         return matches
 
-    async def fetch_profile_metadata(self, npub: str) -> Optional[Dict[str, str]]:
+    async def fetch_profile_metadata(self, identifier: str) -> Optional[Dict[str, str]]:
         """
-        Fetch profile metadata for a given npub from connected relays
+        Fetch profile metadata for a given npub or nprofile from connected relays
         Returns dict with 'name' and 'display_name' fields or None if failed
         """
         try:
-            # Parse the npub to get the public key
-            pubkey = PublicKey.parse(npub)
-            logger.debug(f"Querying connected relays for metadata: {npub[:16]}...")
+            # Parse the identifier (npub or nprofile) to get the public key
+            nip19_obj = Nip19.from_bech32(identifier)
+            enum_obj = nip19_obj.as_enum()
+
+            # Extract public key based on the type
+            if enum_obj.is_pubkey():
+                pubkey = enum_obj.pubkey
+            elif enum_obj.is_profile():
+                pubkey = enum_obj.nprofile.public_key()
+            else:
+                logger.warning(f"Unsupported NIP-19 type for identifier: {identifier[:16]}...")
+                return None
+
+            logger.debug(f"Querying connected relays for metadata: {identifier[:16]}...")
 
             # Fetch metadata using the SDK's built-in method
             # This will query all connected relays
             metadata = await self.nostr_client.fetch_metadata(pubkey, timedelta(seconds=5))
 
             if not metadata:
-                logger.warning(f"No metadata found for {npub} on any connected relay")
+                logger.warning(f"No metadata found for {identifier} on any connected relay")
                 return None
 
             # Parse the metadata JSON to extract name/display_name
@@ -220,7 +239,7 @@ class NostrToBlueskyBot:
                 final_name = display_name or name
 
                 if final_name:
-                    logger.info(f"✓ Resolved {npub[:16]}... → '{final_name}'")
+                    logger.info(f"✓ Resolved {identifier[:16]}... → '{final_name}'")
                     return {'display_name': final_name, 'name': name or ''}
                 else:
                     logger.warning(f"Metadata has no name or display_name")
@@ -231,47 +250,48 @@ class NostrToBlueskyBot:
                 return None
 
         except Exception as e:
-            logger.warning(f"Failed to fetch metadata for {npub}: {e}")
+            logger.warning(f"Failed to fetch metadata for {identifier}: {e}")
             return None
 
     async def replace_npub_mentions(self, content: str) -> str:
         """
-        Replace nostr:npub mentions with display names
+        Replace nostr:npub and nostr:nprofile mentions with display names
         Example: 'hello nostr:npub1v5u...' -> 'hello Fountain'
+        Example: 'hello nostr:nprofile1...' -> 'hello Fountain'
         """
-        # Extract all npub mentions
-        npubs = self.extract_npub_mentions(content)
+        # Extract all npub and nprofile mentions
+        identifiers = self.extract_npub_mentions(content)
 
-        if not npubs:
+        if not identifiers:
             return content
 
-        unique_npubs = list(set(npubs))  # Deduplicate
-        logger.info(f"Found {len(npubs)} npub mention(s) ({len(unique_npubs)} unique) to resolve")
+        unique_identifiers = list(set(identifiers))  # Deduplicate
+        logger.info(f"Found {len(identifiers)} mention(s) ({len(unique_identifiers)} unique) to resolve")
 
         # Create a copy of content to modify
         modified_content = content
         resolved_count = 0
 
-        # Fetch metadata for each unique npub
-        for npub in unique_npubs:
-            metadata = await self.fetch_profile_metadata(npub)
+        # Fetch metadata for each unique identifier
+        for identifier in unique_identifiers:
+            metadata = await self.fetch_profile_metadata(identifier)
 
             if metadata and metadata.get('display_name'):
                 display_name = metadata['display_name']
-                # Replace all occurrences of nostr:npub with the display name
-                mention_pattern = f"nostr:{npub}"
+                # Replace all occurrences of nostr:npub/nprofile with the display name
+                mention_pattern = f"nostr:{identifier}"
                 modified_content = modified_content.replace(mention_pattern, display_name)
                 resolved_count += 1
             else:
-                # If we can't fetch metadata, keep the npub but remove the nostr: prefix
-                mention_pattern = f"nostr:{npub}"
-                modified_content = modified_content.replace(mention_pattern, npub)
-                logger.warning(f"✗ Could not resolve {npub[:16]}..., keeping npub")
+                # If we can't fetch metadata, keep the identifier but remove the nostr: prefix
+                mention_pattern = f"nostr:{identifier}"
+                modified_content = modified_content.replace(mention_pattern, identifier)
+                logger.warning(f"✗ Could not resolve {identifier[:16]}..., keeping identifier")
 
         if resolved_count > 0:
-            logger.info(f"Successfully resolved {resolved_count}/{len(unique_npubs)} mentions")
+            logger.info(f"Successfully resolved {resolved_count}/{len(unique_identifiers)} mentions")
         else:
-            logger.warning(f"Failed to resolve any mentions (0/{len(unique_npubs)})")
+            logger.warning(f"Failed to resolve any mentions (0/{len(unique_identifiers)})")
 
         return modified_content
 
@@ -457,6 +477,11 @@ class NostrToBlueskyBot:
 
         if not content.strip():
             logger.debug(f"Skipping empty event: {event_id}")
+            return
+
+        # Skip if it's a quote event (contains nostr:nevent)
+        if self.is_quote_event(content):
+            logger.info(f"Skipping quote event: {event_id}")
             return
 
         # Log the note
