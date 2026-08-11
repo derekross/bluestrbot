@@ -363,7 +363,7 @@ You can modify `bot.py` to:
 
 ## License
 
-This project is provided as-is for personal use.
+This project is licensed under the GNU General Public License v3.0 or later — see the [LICENSE](LICENSE) file for details.
 
 ## Contributing
 
